@@ -1,0 +1,19 @@
+# --- API ---------------------------------------------------------------
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+orjson==3.11.3
+
+# --- Config / validation -----------------------------------------------
+pydantic==2.13.4
+pydantic-settings==2.11.0
+
+# --- Persistence -------------------------------------------------------
+SQLAlchemy[asyncio]==2.0.43
+asyncpg==0.30.0
+GeoAlchemy2==0.18.0
+shapely==2.1.2
+redis==6.4.0
+
+# --- Ingestion / LLM ---------------------------------------------------
+Telethon==1.41.2
+google-genai==2.18.1

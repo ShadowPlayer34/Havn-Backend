@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# --- shelter ingestion artifacts ---------------------------------------
+# Snapshot of the official register — refetch with scripts/fetch_kyiv_shelters.py.
+data/kyiv_shelters.geojson
+# Legacy OSM extract. No longer ingested: it is bus stops and WWII pillboxes,
+# not shelters anyone can use.
+shelters.pbf
+data/shelters.geojsonl
+
+# Large boundary GeoJSON pulled by scripts/fetch_osm_boundaries.py
+data/osm_*.geojson

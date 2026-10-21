@@ -1,0 +1,78 @@
+{
+  "type": "FeatureCollection",
+  "_comment": "SAMPLE DATA ONLY — coarse bounding boxes for smoke-testing the pipeline. Replace with real administrative boundaries before any real use; resolution quality is entirely a function of this file.",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Шевченківський район",
+        "oblast": "м. Київ",
+        "aliases": ["шевченківський", "шевченкивский", "shevchenkivskyi"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[30.44, 50.44], [30.52, 50.44], [30.52, 50.50], [30.44, 50.50], [30.44, 50.44]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Оболонський район",
+        "oblast": "м. Київ",
+        "aliases": ["оболонь", "оболонский", "obolonskyi"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[30.46, 50.50], [30.56, 50.50], [30.56, 50.58], [30.46, 50.58], [30.46, 50.50]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Дарницький район",
+        "oblast": "м. Київ",
+        "aliases": ["дарниця", "дарницкий", "darnytskyi"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[30.60, 50.36], [30.72, 50.36], [30.72, 50.46], [30.60, 50.46], [30.60, 50.36]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Київська область",
+        "oblast": "Київська",
+        "aliases": ["київщина", "киевская", "kyiv oblast"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[29.30, 49.20], [32.20, 49.20], [32.20, 51.60], [29.30, 51.60], [29.30, 49.20]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Львівська область",
+        "oblast": "Львівська",
+        "aliases": ["львівщина", "львовская", "lviv oblast"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[22.60, 48.70], [25.50, 48.70], [25.50, 50.60], [22.60, 50.60], [22.60, 48.70]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Одеська область",
+        "oblast": "Одеська",
+        "aliases": ["одещина", "одесская", "odesa oblast"]
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[28.30, 45.20], [31.20, 45.20], [31.20, 47.90], [28.30, 47.90], [28.30, 45.20]]]
+      }
+    }
+  ]
+}
