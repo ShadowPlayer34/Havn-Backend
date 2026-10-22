@@ -508,7 +508,7 @@ class WindowProcessor:
                     eta_minutes,
                 )
 
-        message_ids = _resolve_source_ids(threat.source_refs, window)
+        cited = _cited_messages(threat.source_refs, window)
 
         await database.upsert_threat(
             session,
@@ -524,9 +524,22 @@ class WindowProcessor:
                 core_ewkb=geometry.core_ewkb,
                 risk_ewkb=geometry.risk_ewkb,
                 source_channel=window[0].channel if window else None,
-                source_message_ids=message_ids,
+                source_message_ids=[message.message_id for message in cited],
                 raw={
                     "extracted": threat.model_dump(mode="json"),
+                    # The text the extraction was made from. Telegram ids alone
+                    # cannot answer "why is Запоріжжя in a Kyiv recon threat"
+                    # once the channel has moved on, and `raw` is replaced on
+                    # every re-report, so these always belong to `extracted`.
+                    "source_messages": [
+                        {
+                            "channel": message.channel,
+                            "id": message.message_id,
+                            "at": message.timestamp.isoformat(),
+                            "text": message.text,
+                        }
+                        for message in cited
+                    ],
                     "matched_sectors": resolved.matched_names,
                     "unmatched_sectors": resolved.unmatched,
                     "too_far_sectors": resolved.too_far,
@@ -546,17 +559,17 @@ class WindowProcessor:
         await cache.publish_snapshot(self._redis, records)
 
 
-def _resolve_source_ids(
+def _cited_messages(
     refs: list[int], window: list[IncomingMessage]
-) -> list[int]:
-    """Map model-cited batch indices back to real Telegram message ids."""
-    ids: list[int] = []
-    for ref in refs:
+) -> list[IncomingMessage]:
+    """Map model-cited batch indices back to the messages they name, once each."""
+    cited: list[IncomingMessage] = []
+    for ref in dict.fromkeys(refs):
         if 0 <= ref < len(window):
-            ids.append(window[ref].message_id)
+            cited.append(window[ref])
         else:
             logger.warning("source_ref_out_of_range ref=%d window=%d", ref, len(window))
-    return ids
+    return cited
 
 
 # ---------------------------------------------------------------------------
