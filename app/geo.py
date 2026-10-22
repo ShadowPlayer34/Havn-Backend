@@ -15,6 +15,7 @@ an ellipse that is 40% too narrow at Ukrainian latitudes).
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,12 +66,31 @@ class ResolvedSectors:
 #    above separates the candidates. It over-warns rather than under-warns,
 #    which is the correct direction to fail for a shelter alert.
 #
+# One exception runs after the query, in `_nested_choice`: when the winner is a
+# raion or oblast and a tied candidate lies inside it, the two are the same
+# place at different levels, and area is the wrong judge. City and raion share
+# their derived aliases, so rule 4 turned "Бровари" into the 2 890 km²
+# Броварський район instead of the 123 km² city, and "Коростень" into an
+# 11 000 km² raion. The level the source named decides instead — "Полтавська
+# область", "Житомирщина" and "Бориспільський р-н" keep their level, a bare
+# name means the smallest place.
+#
 # `candidates` counts the rows that tied at the top, which is what makes a
 # match usable as an anchor: one candidate is a fact, several are a guess.
 _TYPE_RANK = """
     CASE WHEN {t}.name LIKE '%міська громада%' THEN 0
          WHEN {t}.name LIKE '%селищна громада%' THEN 1
          WHEN {t}.name LIKE '%сільська громада%' THEN 2
+         ELSE 0
+    END
+"""
+
+# Administrative level by name: 0 a hromada or a city such as Київ, 1 a raion,
+# 2 an oblast. Kyiv's districts are raions by name and by this measure, which
+# is harmless — no hromada lies inside one.
+_LEVEL = """
+    CASE WHEN {t}.name LIKE '%область' OR {t}.name LIKE '%Крим%' THEN 2
+         WHEN {t}.name LIKE '%район' THEN 1
          ELSE 0
     END
 """
@@ -190,6 +210,95 @@ _DISTANCE_TO_ANCHOR_SQL = text(
 )
 
 
+# The tied candidate that lies inside the winner, at the smallest level the
+# source allows. "Tied" is the winner's own tier: the same exact name, any
+# alias for an alias match, or the same trigram score.
+_NESTED_SQL = text(
+    f"""
+    SELECT s.id, s.name, s.name_norm,
+           ST_Y(s.centroid) AS lat, ST_X(s.centroid) AS lon,
+           CAST(:candidates AS bigint) AS candidates,
+           CAST(:exact AS boolean) AS exact
+    FROM sectors s, sectors b
+    WHERE b.id = :best_id
+      AND s.id <> b.id
+      AND {_LEVEL.format(t="s")} < {_LEVEL.format(t="b")}
+      AND {_LEVEL.format(t="s")} >= :min_level
+      AND ST_Covers(b.geom, ST_PointOnSurface(s.geom))
+      AND CASE
+              WHEN CAST(:exact AS boolean) THEN s.name_norm = :norm
+              WHEN CAST(:score AS float8) IS NULL THEN :norm = ANY(s.aliases)
+              ELSE abs(
+                       GREATEST(
+                           similarity(s.name_norm, :norm),
+                           COALESCE(
+                               (SELECT max(similarity(alias, :norm)) FROM unnest(s.aliases) AS alias),
+                               0
+                           )
+                       ) - CAST(:score AS float8)
+                   ) < 1e-6
+          END
+    ORDER BY {_LEVEL.format(t="s")} ASC,
+             {_TYPE_RANK.format(t="s")} ASC,
+             ST_Area(s.geom) DESC
+    LIMIT 1
+    """
+)
+
+# What level the source asked for, read before `normalize_sector` strips the
+# words that say it. "-щина" / "-ччина" / "-чина" is the colloquial oblast:
+# "Житомирщина" ties the oblast with its raion, "Хмельниччина" with the city,
+# and both mean the oblast.
+_ASKS_OBLAST = re.compile(
+    r"(?<!\w)обл(?:\.|аст\w*)?(?!\w)|[щч]ин(?:а|и|і|у|ою)\s*$", re.IGNORECASE
+)
+_ASKS_RAION = re.compile(r"(?<!\w)(?:р[-‑]н|район\w*)(?!\w)", re.IGNORECASE)
+
+
+def _asked_level(raw: str) -> int:
+    """The smallest administrative level `raw` may resolve to (see `_LEVEL`)."""
+    if _ASKS_OBLAST.search(raw):
+        return 2
+    if _ASKS_RAION.search(raw):
+        return 1
+    return 0
+
+
+def _level_of(name: str) -> int:
+    """`_LEVEL`, for a row already in hand."""
+    if name.endswith("область") or "Крим" in name:
+        return 2
+    if name.endswith("район"):
+        return 1
+    return 0
+
+
+async def _nested_choice(
+    session: AsyncSession, norm: str, row: Any, min_level: int, fuzzy: bool
+) -> Any:
+    """The tied candidate inside `row` the source more likely meant, else `row`."""
+    if _level_of(row["name"]) <= min_level:
+        return row
+    nested = (
+        (
+            await session.execute(
+                _NESTED_SQL,
+                {
+                    "best_id": row["id"],
+                    "norm": norm,
+                    "min_level": min_level,
+                    "candidates": row["candidates"],
+                    "exact": row["exact"],
+                    "score": row["score"] if fuzzy else None,
+                },
+            )
+        )
+        .mappings()
+        .first()
+    )
+    return nested or row
+
+
 def _anchor_wkt(points: list[tuple[float, float]]) -> str | None:
     """Everything in this report whose position is already certain."""
     if not points:
@@ -209,6 +318,8 @@ class _Lookup:
     fuzzy: bool = False
     #: The sector the model said this place lies in, when that resolved.
     region: Any | None = None
+    #: The smallest administrative level the source's wording allows.
+    min_level: int = 0
 
     def certain(self) -> bool:
         """Good enough to tell a far guess in the same report it is wrong.
@@ -233,6 +344,7 @@ async def _lookup(
     threshold: float,
     anchor: str | None,
     region_id: int | None = None,
+    min_level: int = 0,
 ) -> tuple[Any | None, bool]:
     """One climb up the ladder: exact name, then alias, then trigram.
 
@@ -245,13 +357,15 @@ async def _lookup(
         exact_sql, fuzzy_sql = _MATCH_IN_REGION_SQL, _FUZZY_IN_REGION_SQL
     row = (await session.execute(exact_sql, params)).mappings().first()
     if row is not None:
-        return row, False
+        return await _nested_choice(session, norm, row, min_level, fuzzy=False), False
     row = (
         (await session.execute(fuzzy_sql, {**params, "threshold": threshold}))
         .mappings()
         .first()
     )
-    return row, row is not None
+    if row is None:
+        return None, False
+    return await _nested_choice(session, norm, row, min_level, fuzzy=True), True
 
 
 async def resolve_sectors(
@@ -283,7 +397,7 @@ async def resolve_sectors(
     """
     resolved = ResolvedSectors()
     pending: list[_Lookup] = []
-    region_rows: dict[str, Any | None] = {}
+    region_rows: dict[tuple[str, int], Any | None] = {}
     if region_threshold is None:
         region_threshold = threshold
 
@@ -301,12 +415,15 @@ async def resolve_sectors(
         if not norm:
             continue
 
+        min_level = _asked_level(raw)
         region = await _region_row(session, (regions or {}).get(norm), threshold, region_rows)
         if region is not None:
-            row, fuzzy = await _lookup(session, norm, region_threshold, None, region["id"])
+            row, fuzzy = await _lookup(
+                session, norm, region_threshold, None, region["id"], min_level
+            )
         else:
-            row, fuzzy = await _lookup(session, norm, threshold, None)
-        pending.append(_Lookup(raw, norm, row, fuzzy, region))
+            row, fuzzy = await _lookup(session, norm, threshold, None, None, min_level)
+        pending.append(_Lookup(raw, norm, row, fuzzy, region, min_level))
 
     # A homonym is only as good as the company it keeps. Unambiguous matches —
     # and any raw coordinates — say where this report is.
@@ -327,10 +444,12 @@ async def resolve_sectors(
             # an anchor is a preference, never a filter.
             if item.region is not None:
                 row, fuzzy = await _lookup(
-                    session, item.norm, region_threshold, anchor, item.region["id"]
+                    session, item.norm, region_threshold, anchor, item.region["id"], item.min_level
                 )
             else:
-                row, fuzzy = await _lookup(session, item.norm, threshold, anchor)
+                row, fuzzy = await _lookup(
+                    session, item.norm, threshold, anchor, None, item.min_level
+                )
             if row is not None:
                 item.row, item.fuzzy = row, fuzzy
 
@@ -359,7 +478,7 @@ async def _region_row(
     session: AsyncSession,
     name: str | None,
     threshold: float,
-    cache: dict[str, Any | None],
+    cache: dict[tuple[str, int], Any | None],
 ) -> Any | None:
     """The sector a region hint names, or None when there is no usable hint.
 
@@ -371,12 +490,15 @@ async def _region_row(
     norm = normalize_sector(name)
     if not norm:
         return None
-    if norm not in cache:
-        row, _ = await _lookup(session, norm, threshold, None)
-        cache[norm] = row
+    # Keyed on the level too: "Полтавська" and "Полтавська область" fold to the
+    # same name and mean the city and the oblast.
+    key = (norm, _asked_level(name))
+    if key not in cache:
+        row, _ = await _lookup(session, norm, threshold, None, None, key[1])
+        cache[key] = row
         if row is None:
             logger.info("region_unmatched region=%r", name)
-    return cache[norm]
+    return cache[key]
 
 
 async def _drop_distant_guesses(
