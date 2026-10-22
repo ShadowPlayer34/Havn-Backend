@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     buffer_ceiling_meters: int = 30_000
     point_radius_meters: int = 12_000
     sector_match_threshold: float = 0.45
+    #: The same bar for a name the model placed in a region, where the
+    #: candidates are that region's few dozen sectors rather than all 1600.
+    #: Lets inflected forms through: "Бучу" scores 0.38 against Бучанська.
+    sector_region_match_threshold: float = 0.35
+    #: A trigram match on a name the model gave no region for is dropped when
+    #: it lands further than this from every other place in its report.
+    #: Replayed over the recorded history, correct guesses reach ~250 km
+    #: (Кременчук against Київ) and wrong ones start there — Українки at 253,
+    #: Поділ in Odesa oblast at 310, Берегове at 600+.
+    sector_fuzzy_max_km: float = 250.0
 
     # --- ETA estimation ----------------------------------------------------
     #: Nominal cruise speeds, km/h. Only used when the source did not state an

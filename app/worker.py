@@ -443,7 +443,12 @@ class WindowProcessor:
         window: list[IncomingMessage],
     ) -> bool:
         resolved = await geo.resolve_sectors(
-            session, threat.target_sectors, self._settings.sector_match_threshold
+            session,
+            threat.target_sectors,
+            self._settings.sector_match_threshold,
+            regions=threat.regions_by_sector(),
+            fuzzy_max_meters=self._settings.sector_fuzzy_max_km * 1000.0,
+            region_threshold=self._settings.sector_region_match_threshold,
         )
         if not resolved.is_localisable:
             # No geometry means no spatial answer — storing it would only
@@ -524,6 +529,8 @@ class WindowProcessor:
                     "extracted": threat.model_dump(mode="json"),
                     "matched_sectors": resolved.matched_names,
                     "unmatched_sectors": resolved.unmatched,
+                    "too_far_sectors": resolved.too_far,
+                    "region_fallback_sectors": resolved.region_fallbacks,
                     "eta_source": eta_source,
                     "approach_meters": geometry.approach_meters,
                 },

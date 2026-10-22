@@ -21,14 +21,17 @@ from sqlalchemy import text
 from app.config import get_settings
 from app.database import create_engine, create_sessionmaker, session_scope
 from app.geo import resolve_sectors
+from app.schemas import TargetRegion, region_hints
 
 _PROBES = text(
     """
     SELECT raw->'extracted'->'target_sectors' AS asked,
+           raw->'extracted'->'target_regions' AS regions,
            raw->'matched_sectors' AS matched
     FROM threat_history
     UNION ALL
-    SELECT raw->'extracted'->'target_sectors', raw->'matched_sectors'
+    SELECT raw->'extracted'->'target_sectors', raw->'extracted'->'target_regions',
+           raw->'matched_sectors'
     FROM active_threats
     """
 )
@@ -52,14 +55,24 @@ async def main() -> int:
 
     async with session_scope(sessionmaker) as session:
         rows = (await session.execute(_PROBES)).all()
-        for asked, matched in rows:
+        for asked, regions, matched in rows:
             names = list(asked or [])
             if not names:
                 continue
             reports += 1
+            # Region hints exist only on reports extracted since they were
+            # added; older ones replay without, as the worker would have.
+            hints = region_hints([TargetRegion.model_validate(r) for r in regions or []])
             # Resolved as a report, not name by name: the second pass uses the
             # unambiguous sectors to place the ambiguous ones.
-            result = await resolve_sectors(session, names, settings.sector_match_threshold)
+            result = await resolve_sectors(
+                session,
+                names,
+                settings.sector_match_threshold,
+                regions=hints,
+                fuzzy_max_meters=settings.sector_fuzzy_max_km * 1000.0,
+                region_threshold=settings.sector_region_match_threshold,
+            )
             before = set(matched or [])
             after = set(result.matched_names)
             areas = dict(

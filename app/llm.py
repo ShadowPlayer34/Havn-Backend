@@ -206,14 +206,34 @@ and a longer `ttl_minutes`, since the launch has not happened yet.
 # target_sectors
 
 Copy district, city or oblast names as the source writes them — do not \
-translate, do not expand abbreviations, do not guess a parent region that was \
-not mentioned. The downstream resolver handles inflection and spelling. If the \
-source gives explicit coordinates instead of a place name, emit them as a \
-single string `"lat,lon"` (e.g. `"50.4501,30.5234"`).
+translate, do not expand abbreviations, do not add a parent region that was \
+not mentioned (where a place lies goes in `target_regions`, never in this \
+list). The downstream resolver handles inflection and spelling. If the source \
+gives explicit coordinates instead of a place name, emit them as a single \
+string `"lat,lon"` (e.g. `"50.4501,30.5234"`).
 
 Leave `target_sectors` empty rather than inventing a location. An unlocalised \
 threat is dropped downstream; a wrongly localised one sends people to shelter \
 in the wrong city.
+
+# target_regions
+
+Place names repeat across Ukraine: Поділ, Воскресенка, Березняки, Калинівка \
+and Борщагівка each exist in several oblasts, and "Правий берег" on a Kyiv \
+channel is the right bank of Kyiv, not Берегове in Zakarpattia. For every \
+`target_sectors` entry smaller than an oblast — a city, town, village, \
+district, neighbourhood or landmark — add one entry saying where it is:
+
+- `sector` — the entry, copied exactly as you wrote it in `target_sectors`.
+- `region` — the oblast it lies in, in Ukrainian ("Київська область", \
+  "Полтавська область"). For a district, neighbourhood or landmark inside \
+  Kyiv, Kharkiv, Odesa, Dnipro or another large city, the city instead \
+  ("Київ", "Харків").
+
+Judge from the batch first — the other places in the same report, what the \
+channel covers — and from your knowledge of Ukrainian geography second. Skip \
+the entry when you are not sure: a missing region costs precision, a wrong one \
+moves the warning to the wrong place. No entries for oblasts or coordinates.
 
 # confidence_score
 

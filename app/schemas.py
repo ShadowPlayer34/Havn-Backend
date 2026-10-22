@@ -46,6 +46,23 @@ THREAT_PRIORITY: dict[str, int] = {
 # They also carry no `extra="forbid"`: that makes Pydantic emit
 # `additionalProperties`, which reaches the Gemini REST API as
 # `additional_properties` and is rejected with a 400.
+#
+# `TargetRegion` is a list of pairs rather than a name -> region mapping for the
+# same reason: a dict field is `additionalProperties` by another name.
+class TargetRegion(BaseModel):
+    """Where one of the target places lies."""
+
+    sector: str = Field(
+        description="The target_sectors entry this is about, copied exactly as "
+        "written there."
+    )
+    region: str = Field(
+        description="The oblast it lies in, or the city for a district, "
+        'neighbourhood or landmark of a large city — e.g. "Київ", '
+        '"Київська область", "Полтавська область".'
+    )
+
+
 class ExtractedThreat(BaseModel):
     """One aerial threat cluster: what it is, how many, and where it is headed."""
 
@@ -66,6 +83,13 @@ class ExtractedThreat(BaseModel):
         description="Administrative district / oblast / city names being "
         "threatened, exactly as written in the source. May also contain a raw "
         'coordinate pair formatted as "lat,lon" when the source gives one.',
+    )
+    target_regions: list[TargetRegion] = Field(
+        default_factory=list,
+        max_length=32,
+        description="For each target_sectors entry smaller than an oblast, the "
+        "oblast or large city it lies in. Omit entries you are unsure of, and "
+        "oblasts and coordinates themselves.",
     )
     confidence_score: float = Field(
         ge=0.0,
@@ -99,6 +123,10 @@ class ExtractedThreat(BaseModel):
         description="Indices of the batch messages ([0], [1], ...) that "
         "support this threat. Never invent an index.",
     )
+
+    def regions_by_sector(self) -> dict[str, str]:
+        """`target_regions` keyed the way the resolver compares names."""
+        return region_hints(self.target_regions)
 
     def dedup_key(self) -> str:
         """Stable identity for a cluster: type + the set of target sectors.
@@ -313,6 +341,21 @@ def normalize_sector(name: str) -> str:
     text = _NOISE_RE.sub(" ", text)
     text = _PUNCT_RE.sub(" ", text)
     return _WS_RE.sub(" ", text).strip()
+
+
+def region_hints(entries: list[TargetRegion]) -> dict[str, str]:
+    """Region hints keyed on the folded sector name.
+
+    Folded rather than raw so an entry still lines up when the model's echo of
+    the sector differs only in case or punctuation from what it wrote in
+    `target_sectors`. The first entry for a name wins.
+    """
+    regions: dict[str, str] = {}
+    for entry in entries:
+        key = normalize_sector(entry.sector)
+        if key and entry.region.strip():
+            regions.setdefault(key, entry.region)
+    return regions
 
 
 def parse_coordinate(value: str) -> tuple[float, float] | None:
