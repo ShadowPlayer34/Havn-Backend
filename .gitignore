@@ -15,3 +15,6 @@ data/shelters.geojsonl
 
 # Large boundary GeoJSON pulled by scripts/fetch_osm_boundaries.py
 data/osm_*.geojson
+# Early full-country hromada extract, superseded by data/osm_hromadas.geojson.
+# 116 MB — over GitHub's per-file limit, and nothing reads it.
+/ukraine_hromadas.geojson
