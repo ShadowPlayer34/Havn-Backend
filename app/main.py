@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import ORJSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -23,10 +23,17 @@ from app import cache, database
 from app.config import Settings, get_settings
 from app.schemas import (
     ActiveThreat,
+    FactTallies,
+    FactTally,
     NearestSheltersResponse,
+    ReviewChecks,
+    ReviewOut,
     ShelterOut,
+    ShelterRating,
     ShelterReportAck,
     ShelterReportRequest,
+    ShelterReviewRequest,
+    ShelterReviewsResponse,
     ThreatCheckResponse,
 )
 from app.spatial import (
@@ -468,6 +475,7 @@ async def nearest_shelters(
                 wifi=r.wifi,
                 notes=r.notes,
                 reports=r.reports,
+                rating=_rating(r.rating, r.review_count),
                 latitude=r.latitude,
                 longitude=r.longitude,
                 distance_meters=round(r.distance_meters, 1),
@@ -515,3 +523,129 @@ async def report_shelter(
 
     logger.info("shelter_reported id=%s reason=%s total=%d", shelter_id, payload.reason, count)
     return ShelterReportAck(shelter_id=shelter_id, reports=count)
+
+
+#: The anonymous device id the app already sends with reports. A header rather than a
+#: body field on the review endpoints: the GET and the DELETE have no body to carry it,
+#: and one convention for all three beats a body field on one of them.
+ClientID = Annotated[str, Header(alias="X-Client-ID", min_length=8, max_length=64)]
+
+
+def _rating(average: float | None, count: int) -> ShelterRating | None:
+    if not count or average is None:
+        return None
+    return ShelterRating(average=round(average, 2), count=count)
+
+
+def _review_out(review: database.ReviewRecord) -> ReviewOut:
+    return ReviewOut(
+        id=review.id,
+        rating=review.rating,
+        checks=ReviewChecks(**review.checks),
+        text=review.text,
+        created_at=review.created_at,
+        updated_at=review.updated_at,
+    )
+
+
+def _reviews_out(shelter_id: str, reviews: database.ShelterReviews) -> ShelterReviewsResponse:
+    return ShelterReviewsResponse(
+        shelter_id=shelter_id,
+        rating=_rating(reviews.average, reviews.count),
+        facts=FactTallies(
+            **{
+                fact: FactTally(confirmed=tally.confirmed, disputed=tally.disputed)
+                for fact, tally in reviews.facts.items()
+            }
+        ),
+        reviews=[_review_out(r) for r in reviews.reviews],
+        mine=_review_out(reviews.mine) if reviews.mine else None,
+    )
+
+
+@app.get(
+    "/api/v1/shelters/{shelter_id}/reviews",
+    response_model=ShelterReviewsResponse,
+    summary="What people who have been to a shelter say about it",
+)
+async def shelter_reviews(
+    shelter_id: str,
+    response: Response,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client_id: Annotated[
+        str | None, Header(alias="X-Client-ID", min_length=8, max_length=64)
+    ] = None,
+) -> ShelterReviewsResponse:
+    """The rating, how each register fact held up, and the newest reviews.
+
+    Optional `X-Client-ID` only picks out the caller's own review, so the app can offer
+    to edit it; nobody else's review says whose it is.
+    """
+    # Carries the caller's own review, so it must not be shared from a cache.
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        reviews = await database.load_shelter_reviews(session, shelter_id, client_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="No such shelter") from None
+    return _reviews_out(shelter_id, reviews)
+
+
+@app.put(
+    "/api/v1/shelters/{shelter_id}/review",
+    response_model=ShelterReviewsResponse,
+    summary="Rate a shelter and check what the register says about it",
+)
+async def review_shelter(
+    shelter_id: str,
+    payload: ShelterReviewRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client_id: ClientID,
+) -> ShelterReviewsResponse:
+    """One review per device per place: writing again edits it.
+
+    Like reports, reviews never move a shelter in the ranking. The nearest doorway is
+    the nearest doorway whatever its stars; the rating travels with it so people can
+    read it, and a register fact enough reviewers dispute is flagged where it is shown.
+    """
+    try:
+        await database.save_shelter_review(
+            session,
+            shelter_id=shelter_id,
+            client_id=client_id,
+            rating=payload.rating,
+            checks=payload.checks.model_dump(),
+            review_text=payload.text,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="No such shelter") from None
+    except database.ReviewRateLimited:
+        logger.warning("shelter_review_rate_limited client=%s", client_id[:8])
+        raise HTTPException(
+            status_code=429,
+            detail="Too many shelters reviewed from this device in the last hour.",
+        ) from None
+
+    reviews = await database.load_shelter_reviews(session, shelter_id, client_id)
+    logger.info(
+        "shelter_reviewed id=%s rating=%d total=%d", shelter_id, payload.rating, reviews.count
+    )
+    return _reviews_out(shelter_id, reviews)
+
+
+@app.delete(
+    "/api/v1/shelters/{shelter_id}/review",
+    response_model=ShelterReviewsResponse,
+    summary="Withdraw this device's review of a shelter",
+)
+async def delete_shelter_review(
+    shelter_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    client_id: ClientID,
+) -> ShelterReviewsResponse:
+    try:
+        await database.delete_shelter_review(session, shelter_id, client_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="No such shelter") from None
+    return _reviews_out(
+        shelter_id, await database.load_shelter_reviews(session, shelter_id, client_id)
+    )

@@ -437,6 +437,129 @@ async def main() -> int:
         ).scalars().all()
     check("KNN uses the GiST index", any("Index Scan" in line for line in plan), plan[0].strip())
 
+    print("\n=== 7. shelter reviews ===")
+    # Run-scoped device ids, so a real person's review is never touched and the
+    # cleanup below cannot reach one.
+    alice, bob, carol = (f"smoketest-{run_id}-{name}" for name in ("a", "b", "c"))
+    async with database.session_scope(sessionmaker) as session:
+        # A doorway the register lists twice, with every fact stated: reviews have to
+        # pool across the rows, and every check has something to be right about.
+        twin = (
+            await session.execute(
+                text(
+                    """
+                    SELECT array_agg(id ORDER BY id) AS ids,
+                           (array_agg(ST_Y(geom) ORDER BY id))[1] AS lat,
+                           (array_agg(ST_X(geom) ORDER BY id))[1] AS lon
+                    FROM shelters
+                    WHERE wifi IS NOT NULL AND accessible IS NOT NULL
+                      AND COALESCE(working_time, '') <> ''
+                    GROUP BY ST_SnapToGrid(geom, 0.00001)
+                    HAVING count(*) = 2
+                    LIMIT 1
+                    """
+                )
+            )
+        ).mappings().one_or_none()
+        # And one with no Wi-Fi column at all — the city register.
+        silent = (
+            await session.execute(text("SELECT id FROM shelters WHERE wifi IS NULL LIMIT 1"))
+        ).scalar_one_or_none()
+        # Enough separate places to run one device out of budget.
+        spread = (
+            await session.execute(
+                text(
+                    """
+                    SELECT id FROM (
+                        SELECT DISTINCT ON (ST_SnapToGrid(geom, 0.00001)) id
+                        FROM shelters ORDER BY ST_SnapToGrid(geom, 0.00001), id
+                    ) places
+                    LIMIT :n
+                    """
+                ),
+                {"n": database.REVIEW_RATE_LIMIT_PER_HOUR + 1},
+            )
+        ).scalars().all()
+
+    check("found a doorway listed twice", twin is not None)
+    if twin is not None:
+        first, second = twin["ids"]
+        all_checks = {"location": True, "hours": False, "accessible": True, "wifi": False}
+        async with database.session_scope(sessionmaker) as session:
+            await database.save_shelter_review(session, first, alice, 4, all_checks, "smoke")
+            seen = await database.load_shelter_reviews(session, second, alice)
+        check("review counts for the sibling row", seen.count == 1, f"{seen.count}")
+        check("caller's own review comes back as mine", seen.mine is not None and not seen.reviews)
+        check(
+            "every stated fact keeps its verdict",
+            seen.mine is not None and seen.mine.checks == all_checks,
+            str(seen.mine.checks if seen.mine else None),
+        )
+
+        async with database.session_scope(sessionmaker) as session:
+            await database.save_shelter_review(session, second, alice, 2, {}, None)
+            await database.save_shelter_review(session, first, bob, 5, {"hours": True}, None)
+            seen = await database.load_shelter_reviews(session, first, None)
+            rows = (
+                await session.execute(
+                    text("SELECT count(*) FROM shelter_reviews WHERE client_id = :c"),
+                    {"c": alice},
+                )
+            ).scalar_one()
+        check("re-review on a sibling replaces, not adds", rows == 1, f"{rows} row(s)")
+        check("one voice per device per place", seen.count == 2, f"{seen.count}")
+        check("average is per device", seen.average == 3.5, f"{seen.average}")
+        check(
+            "fact tallies follow the latest reviews",
+            seen.facts["hours"].confirmed == 1 and seen.facts["hours"].disputed == 0,
+            str(seen.facts["hours"]),
+        )
+        check("anonymous read has no mine", seen.mine is None and len(seen.reviews) == 2)
+
+        async with database.session_scope(sessionmaker) as session:
+            nearest = await database.find_nearest_shelters(session, twin["lat"], twin["lon"], 1)
+        check(
+            "nearest carries the place's rating",
+            bool(nearest) and nearest[0].review_count == 2 and nearest[0].rating == 3.5,
+            f"{nearest[0].rating} × {nearest[0].review_count}" if nearest else "no rows",
+        )
+
+        async with database.session_scope(sessionmaker) as session:
+            await database.delete_shelter_review(session, first, alice)
+            seen = await database.load_shelter_reviews(session, second, alice)
+        check("delete withdraws it from the place", seen.count == 1 and seen.mine is None)
+
+    if silent is not None:
+        async with database.session_scope(sessionmaker) as session:
+            await database.save_shelter_review(
+                session, silent, alice, 3, {"location": False, "wifi": True}, None
+            )
+            seen = await database.load_shelter_reviews(session, silent, alice)
+        check(
+            "verdict on an unstated fact is dropped",
+            seen.mine is not None and seen.mine.checks == {"location": False},
+            str(seen.mine.checks if seen.mine else None),
+        )
+
+    limited = False
+    async with database.session_scope(sessionmaker) as session:
+        for shelter_id in spread[: database.REVIEW_RATE_LIMIT_PER_HOUR]:
+            await database.save_shelter_review(session, shelter_id, carol, 3, {}, None)
+        # Editing is free…
+        await database.save_shelter_review(session, spread[0], carol, 4, {}, None)
+        # …somewhere new is not.
+        try:
+            await database.save_shelter_review(session, spread[-1], carol, 3, {}, None)
+        except database.ReviewRateLimited:
+            limited = True
+    check("review rate limit applies to new places only", limited)
+
+    async with database.session_scope(sessionmaker) as session:
+        await session.execute(
+            text("DELETE FROM shelter_reviews WHERE client_id LIKE :run"),
+            {"run": f"smoketest-{run_id}-%"},
+        )
+
 
     await redis.aclose()
     await engine.dispose()

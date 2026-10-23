@@ -26,10 +26,12 @@ from sqlalchemy import (
     ARRAY,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     func,
@@ -158,6 +160,51 @@ class ShelterReport(Base):
     __table_args__ = (
         # One device, one voice per problem per shelter.
         Index("ux_shelter_reports_dedup", "shelter_id", "client_id", "reason", unique=True),
+    )
+
+
+class ShelterReview(Base):
+    """Someone who has been there saying what the place is like.
+
+    A report says "this entry is wrong"; a review says how good the shelter is and
+    checks the register line by line. The ``*_ok`` columns are those checks — true when
+    what the person found matches the register, false when it does not, NULL when they
+    did not look. A check on a fact the register does not state is dropped at write
+    time, so a tally never counts verdicts on something nobody was told.
+
+    Same anonymity as reports: a client-generated UUID that is never served back, and
+    no position.
+    """
+
+    __tablename__ = "shelter_reviews"
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    shelter_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: 1–5, how good a shelter this is overall.
+    rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    #: The entrance is where the pin is.
+    location_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: It was open when the register's hours say it is.
+    hours_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: The register's step-free yes/no is right.
+    accessible_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: The register's Wi-Fi yes/no is right.
+    wifi_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("rating BETWEEN 1 AND 5", name="ck_shelter_reviews_rating"),
+        # One device, one review per entry; writing again edits it.
+        Index("ux_shelter_reviews_client", "shelter_id", "client_id", unique=True),
     )
 
 
@@ -620,6 +667,10 @@ class NearestShelter:
     notes: str | None
     #: Distinct devices that have flagged a problem here.
     reports: int
+    #: Mean review rating for the place, 1–5; None until someone has reviewed it.
+    rating: float | None
+    #: Distinct devices that have reviewed the place.
+    review_count: int
     latitude: float
     longitude: float
     distance_meters: float
@@ -657,26 +708,40 @@ _NEAREST_SHELTERS_SQL = text(
                  (working_time ILIKE '%цілодобово%') DESC,
                  (source = 'kmda') DESC,
                  id
+    ),
+    -- Strictly by distance. An earlier version sank flagged entries, which at limit=5
+    -- pushed the *nearest* shelter off the list entirely — three anonymous taps and the
+    -- closest doorway disappears. That is the denial-of-service this feature must not
+    -- become. The count travels with the row instead, and the app warns; a human
+    -- decides whether the entry is actually wrong. Ratings follow the same rule: a
+    -- one-star review is a reason to read, not a reason to be sent further away.
+    nearest AS (
+        SELECT c.*, ST_DistanceSphere(c.geom, pt.g) AS distance_meters
+        FROM deduped c
+        CROSS JOIN pt
+        ORDER BY distance_meters
+        LIMIT :limit
     )
-    SELECT c.id,
-           c.name,
-           c.shelter_type,
-           c.source,
-           c.address,
-           c.district,
-           c.kind,
-           c.building_type,
-           c.working_time,
-           c.phone,
-           c.accessible,
-           c.wifi,
-           c.notes,
+    SELECT n.id,
+           n.name,
+           n.shelter_type,
+           n.source,
+           n.address,
+           n.district,
+           n.kind,
+           n.building_type,
+           n.working_time,
+           n.phone,
+           n.accessible,
+           n.wifi,
+           n.notes,
            COALESCE(r.reports, 0) AS reports,
-           ST_Y(c.geom) AS latitude,
-           ST_X(c.geom) AS longitude,
-           ST_DistanceSphere(c.geom, pt.g) AS distance_meters
-    FROM deduped c
-    CROSS JOIN pt
+           rv.rating,
+           rv.review_count,
+           ST_Y(n.geom) AS latitude,
+           ST_X(n.geom) AS longitude,
+           n.distance_meters
+    FROM nearest n
     -- Reports aggregate by *place*, not by row. The register lists one doorway several
     -- times and the dedupe above picks an arbitrary representative, so a report filed
     -- against one duplicate has to count for the entry everybody else is shown.
@@ -686,14 +751,22 @@ _NEAREST_SHELTERS_SQL = text(
         FROM shelter_reports rep
         JOIN shelters s2 ON s2.id = rep.shelter_id
         GROUP BY 1
-    ) r ON r.g = ST_SnapToGrid(c.geom, 0.00001)
-    -- Strictly by distance. An earlier version sank flagged entries, which at limit=5
-    -- pushed the *nearest* shelter off the list entirely — three anonymous taps and the
-    -- closest doorway disappears. That is the denial-of-service this feature must not
-    -- become. The count travels with the row instead, and the app warns; a human
-    -- decides whether the entry is actually wrong.
-    ORDER BY distance_meters
-    LIMIT :limit
+    ) r ON r.g = ST_SnapToGrid(n.geom, 0.00001)
+    -- Ratings aggregate by place for the same reason. Joined after the limit, per row:
+    -- the `&&` lets the GiST index find the doorway's siblings, so the cost follows
+    -- `limit`, not how many reviews exist.
+    LEFT JOIN LATERAL (
+        SELECT avg(latest.rating)::float AS rating, count(*) AS review_count
+        FROM (
+            SELECT DISTINCT ON (rev.client_id) rev.rating
+            FROM shelters s3
+            JOIN shelter_reviews rev ON rev.shelter_id = s3.id
+            WHERE s3.geom && ST_Expand(n.geom, 0.00002)
+              AND ST_SnapToGrid(s3.geom, 0.00001) = ST_SnapToGrid(n.geom, 0.00001)
+            ORDER BY rev.client_id, rev.updated_at DESC
+        ) latest
+    ) rv ON true
+    ORDER BY n.distance_meters
     """
 )
 
@@ -727,6 +800,8 @@ async def find_nearest_shelters(
             wifi=row["wifi"],
             notes=row["notes"],
             reports=int(row["reports"]),
+            rating=row["rating"],
+            review_count=int(row["review_count"]),
             latitude=float(row["latitude"]),
             longitude=float(row["longitude"]),
             distance_meters=float(row["distance_meters"]),
@@ -819,4 +894,291 @@ async def record_shelter_report(
                 {"id": shelter_id},
             )
         ).scalar_one()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reviews
+# ---------------------------------------------------------------------------
+
+#: The register facts a review can check, each backed by a ``<fact>_ok`` column.
+REVIEW_FACTS: tuple[str, ...] = ("location", "hours", "accessible", "wifi")
+
+#: How many *different* shelters one device may review per hour. Same reasoning as
+#: ``REPORT_RATE_LIMIT_PER_HOUR``: editing a review you already wrote is free, walking
+#: the map to rate everything in a district is not.
+REVIEW_RATE_LIMIT_PER_HOUR = 8
+
+#: Newest reviews served per place. The summary always covers all of them.
+REVIEW_PAGE_SIZE = 50
+
+
+class ReviewRateLimited(Exception):
+    """Raised when one device has reviewed too many shelters in the last hour."""
+
+
+@dataclass(slots=True)
+class ReviewRecord:
+    id: str
+    rating: int
+    #: fact -> verdict, for the facts this person checked.
+    checks: dict[str, bool]
+    text: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class FactTally:
+    #: People who found the register right about this.
+    confirmed: int
+    #: People who found it wrong.
+    disputed: int
+
+
+@dataclass(slots=True)
+class ShelterReviews:
+    #: Distinct devices with a review of the place.
+    count: int
+    average: float | None
+    facts: dict[str, FactTally]
+    #: Newest first, without the caller's own.
+    reviews: list[ReviewRecord]
+    mine: ReviewRecord | None
+
+
+#: Every register row at the same doorway as ``:id``, ``:id`` included.
+#:
+#: Reviews belong to the place for the reason reports do: the nearest-shelter dedupe
+#: shows one of several rows for a doorway, and a review filed against any of them has
+#: to count for the one people are shown. ``&&`` lets the GiST index find candidates
+#: before the exact grid comparison; two points that snap to one cell are always
+#: within one cell of each other, so the box loses nothing.
+_PLACE_CTE = """
+    place AS (
+        SELECT s2.id
+        FROM shelters s
+        JOIN shelters s2
+          ON s2.geom && ST_Expand(s.geom, 0.00002)
+         AND ST_SnapToGrid(s2.geom, 0.00001) = ST_SnapToGrid(s.geom, 0.00001)
+        WHERE s.id = :id
+    )
+"""
+
+#: One review per device per place — its latest — however many rows it landed on.
+_LATEST_CTE = """
+    latest AS (
+        SELECT DISTINCT ON (rev.client_id) rev.*
+        FROM shelter_reviews rev
+        WHERE rev.shelter_id IN (SELECT id FROM place)
+        ORDER BY rev.client_id, rev.updated_at DESC
+    )
+"""
+
+_FACT_COLUMNS = ", ".join(f"{fact}_ok" for fact in REVIEW_FACTS)
+_FACT_TALLIES = ", ".join(
+    f"count(*) FILTER (WHERE {fact}_ok) AS {fact}_confirmed, "
+    f"count(*) FILTER (WHERE NOT {fact}_ok) AS {fact}_disputed"
+    for fact in REVIEW_FACTS
+)
+
+_REVIEW_SUMMARY_SQL = text(
+    f"""
+    WITH {_PLACE_CTE}, {_LATEST_CTE}
+    SELECT count(*) AS count,
+           avg(rating)::float AS average,
+           {_FACT_TALLIES}
+    FROM latest
+    """
+)
+
+_REVIEW_LIST_SQL = text(
+    f"""
+    WITH {_PLACE_CTE}, {_LATEST_CTE}
+    SELECT id, rating, text, created_at, updated_at,
+           {_FACT_COLUMNS},
+           COALESCE(client_id = :client_id, false) AS is_mine
+    FROM latest
+    -- The caller's own first, so the page cannot cut it off.
+    ORDER BY is_mine DESC, updated_at DESC
+    LIMIT :limit
+    """
+)
+
+
+def _review_record(row) -> ReviewRecord:
+    return ReviewRecord(
+        id=row["id"],
+        rating=int(row["rating"]),
+        checks={
+            fact: bool(row[f"{fact}_ok"])
+            for fact in REVIEW_FACTS
+            if row[f"{fact}_ok"] is not None
+        },
+        text=row["text"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def load_shelter_reviews(
+    session: AsyncSession, shelter_id: str, client_id: str | None
+) -> ShelterReviews:
+    """Summary and newest reviews for the place ``shelter_id`` stands at.
+
+    ``client_id`` only picks out the caller's own review so the app can offer to edit
+    it. It is never served back, and no review says whose it is.
+    """
+    exists = (
+        await session.execute(
+            text("SELECT 1 FROM shelters WHERE id = :id"), {"id": shelter_id}
+        )
+    ).scalar_one_or_none()
+    if exists is None:
+        raise LookupError(shelter_id)
+
+    summary = (
+        (await session.execute(_REVIEW_SUMMARY_SQL, {"id": shelter_id})).mappings().one()
+    )
+    rows = (
+        await session.execute(
+            _REVIEW_LIST_SQL,
+            {"id": shelter_id, "client_id": client_id, "limit": REVIEW_PAGE_SIZE},
+        )
+    ).mappings().all()
+
+    mine = next((_review_record(r) for r in rows if r["is_mine"]), None)
+    return ShelterReviews(
+        count=int(summary["count"]),
+        average=summary["average"],
+        facts={
+            fact: FactTally(
+                confirmed=int(summary[f"{fact}_confirmed"]),
+                disputed=int(summary[f"{fact}_disputed"]),
+            )
+            for fact in REVIEW_FACTS
+        },
+        reviews=[_review_record(r) for r in rows if not r["is_mine"]],
+        mine=mine,
+    )
+
+
+async def save_shelter_review(
+    session: AsyncSession,
+    shelter_id: str,
+    client_id: str,
+    rating: int,
+    checks: dict[str, bool | None],
+    review_text: str | None,
+) -> None:
+    """Write or replace this device's review of the place.
+
+    A verdict on a fact the register does not state — Wi-Fi on a city entry, hours on a
+    row with none — is dropped rather than refused: the answer is still worth having,
+    the verdict just has nothing to be right or wrong about.
+    """
+    stated = (
+        await session.execute(
+            text(
+                """
+                SELECT COALESCE(working_time, '') <> '' AS hours,
+                       accessible IS NOT NULL AS accessible,
+                       wifi IS NOT NULL AS wifi
+                FROM shelters WHERE id = :id
+                """
+            ),
+            {"id": shelter_id},
+        )
+    ).mappings().one_or_none()
+    if stated is None:
+        raise LookupError(shelter_id)
+
+    # Only a first review of somewhere new spends the budget; editing never does.
+    recent = int(
+        (
+            await session.execute(
+                text(
+                    f"""
+                    WITH {_PLACE_CTE}
+                    SELECT count(DISTINCT shelter_id) FROM shelter_reviews
+                    WHERE client_id = :client_id
+                      AND created_at > now() - interval '1 hour'
+                      AND shelter_id NOT IN (SELECT id FROM place)
+                    """
+                ),
+                {"id": shelter_id, "client_id": client_id},
+            )
+        ).scalar_one()
+    )
+    if recent >= REVIEW_RATE_LIMIT_PER_HOUR:
+        raise ReviewRateLimited(client_id)
+
+    verdicts = {
+        fact: checks.get(fact) if fact == "location" or stated[fact] else None
+        for fact in REVIEW_FACTS
+    }
+
+    # A review left on another row of the same doorway is this one, superseded.
+    await session.execute(
+        text(
+            f"""
+            WITH {_PLACE_CTE}
+            DELETE FROM shelter_reviews
+            WHERE client_id = :client_id
+              AND shelter_id IN (SELECT id FROM place)
+              AND shelter_id <> :id
+            """
+        ),
+        {"id": shelter_id, "client_id": client_id},
+    )
+    await session.execute(
+        text(
+            """
+            INSERT INTO shelter_reviews (
+                id, shelter_id, client_id, rating,
+                location_ok, hours_ok, accessible_ok, wifi_ok, text
+            )
+            VALUES (
+                gen_random_uuid()::text, :id, :client_id, :rating,
+                :location_ok, :hours_ok, :accessible_ok, :wifi_ok, :text
+            )
+            ON CONFLICT (shelter_id, client_id) DO UPDATE SET
+                rating        = EXCLUDED.rating,
+                location_ok   = EXCLUDED.location_ok,
+                hours_ok      = EXCLUDED.hours_ok,
+                accessible_ok = EXCLUDED.accessible_ok,
+                wifi_ok       = EXCLUDED.wifi_ok,
+                text          = EXCLUDED.text,
+                updated_at    = now()
+            """
+        ),
+        {
+            "id": shelter_id,
+            "client_id": client_id,
+            "rating": rating,
+            "text": review_text,
+            **{f"{fact}_ok": verdict for fact, verdict in verdicts.items()},
+        },
+    )
+
+
+async def delete_shelter_review(session: AsyncSession, shelter_id: str, client_id: str) -> None:
+    """Withdraw this device's review of the place. Deleting nothing is not an error."""
+    exists = (
+        await session.execute(
+            text("SELECT 1 FROM shelters WHERE id = :id"), {"id": shelter_id}
+        )
+    ).scalar_one_or_none()
+    if exists is None:
+        raise LookupError(shelter_id)
+
+    await session.execute(
+        text(
+            f"""
+            WITH {_PLACE_CTE}
+            DELETE FROM shelter_reviews
+            WHERE client_id = :client_id AND shelter_id IN (SELECT id FROM place)
+            """
+        ),
+        {"id": shelter_id, "client_id": client_id},
     )
