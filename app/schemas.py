@@ -17,7 +17,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # LLM extraction contract
@@ -246,6 +246,12 @@ class ActiveThreat(BaseModel):
     eta_minutes: int | None = None
 
 
+class ShelterRating(BaseModel):
+    #: Mean of the 1–5 ratings, one per device.
+    average: float
+    count: int
+
+
 class ShelterOut(BaseModel):
     """One shelter, as the map needs it: identity, position, distance."""
 
@@ -271,6 +277,8 @@ class ShelterOut(BaseModel):
     notes: str | None = None
     #: Distinct devices that have reported a problem with this entry.
     reports: int = 0
+    #: What reviewers make of the place. Null until somebody has reviewed it.
+    rating: ShelterRating | None = None
     latitude: float
     longitude: float
     distance_meters: float
@@ -292,6 +300,69 @@ class ShelterReportRequest(BaseModel):
 class ShelterReportAck(BaseModel):
     shelter_id: str
     reports: int
+
+
+class ReviewChecks(BaseModel):
+    """One person's verdict on each register fact: true when it matched what they
+    found, false when it did not, null when they did not check."""
+
+    #: The entrance is where the pin is.
+    location: bool | None = None
+    #: It was open when the hours say it is.
+    hours: bool | None = None
+    #: The step-free yes/no is right.
+    accessible: bool | None = None
+    #: The Wi-Fi yes/no is right.
+    wifi: bool | None = None
+
+
+class ShelterReviewRequest(BaseModel):
+    """Writing again replaces the device's earlier review; it does not add a second."""
+
+    rating: int = Field(ge=1, le=5)
+    checks: ReviewChecks = Field(default_factory=ReviewChecks)
+    text: str | None = Field(default=None, max_length=500)
+
+    @field_validator("text")
+    @classmethod
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        value = value.strip() if value else None
+        return value or None
+
+
+class ReviewOut(BaseModel):
+    id: str
+    rating: int
+    checks: ReviewChecks
+    text: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class FactTally(BaseModel):
+    #: Reviewers who found the register right about this.
+    confirmed: int = 0
+    #: Reviewers who found it wrong.
+    disputed: int = 0
+
+
+class FactTallies(BaseModel):
+    location: FactTally = Field(default_factory=FactTally)
+    hours: FactTally = Field(default_factory=FactTally)
+    accessible: FactTally = Field(default_factory=FactTally)
+    wifi: FactTally = Field(default_factory=FactTally)
+
+
+class ShelterReviewsResponse(BaseModel):
+    shelter_id: str
+    #: Null until somebody has reviewed the place.
+    rating: ShelterRating | None = None
+    #: How the register's facts held up, across every review of the place.
+    facts: FactTallies
+    #: Newest first, at most `database.REVIEW_PAGE_SIZE`, without the caller's own.
+    reviews: list[ReviewOut]
+    #: The caller's own review, matched on `X-Client-ID`, so it can be edited.
+    mine: ReviewOut | None = None
 
 
 # ---------------------------------------------------------------------------
