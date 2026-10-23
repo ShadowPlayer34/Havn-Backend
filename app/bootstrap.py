@@ -34,6 +34,19 @@ async def ensure_schema(engine: AsyncEngine) -> None:
                 "ADD COLUMN IF NOT EXISTS origin_sector varchar(160)"
             )
         )
+        await conn.execute(
+            text("ALTER TABLE shelters ADD COLUMN IF NOT EXISTS wifi boolean")
+        )
+        # Wi-Fi used to be folded into `notes` as a sentence. Recover the rows
+        # already loaded that way so the new field is populated without waiting
+        # for a re-import; the "no Wi-Fi" half of the register left no trace in
+        # `notes`, so those rows stay NULL until the loader runs again.
+        await conn.execute(
+            text(
+                "UPDATE shelters SET wifi = true, notes = NULL "
+                "WHERE wifi IS NULL AND notes = 'Wi-Fi available'"
+            )
+        )
         # Trigram index for the fuzzy district-name fallback in geo.py.
         await conn.execute(
             text(

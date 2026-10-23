@@ -266,6 +266,8 @@ class ShelterOut(BaseModel):
     working_time: str | None = None
     phone: str | None = None
     accessible: bool | None = None
+    #: Wi-Fi on site, per the register. Null where it does not say.
+    wifi: bool | None = None
     notes: str | None = None
     #: Distinct devices that have reported a problem with this entry.
     reports: int = 0

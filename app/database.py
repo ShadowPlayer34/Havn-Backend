@@ -120,6 +120,10 @@ class Shelter(Base):
     owner: Mapped[str | None] = mapped_column(String(300), nullable=True)
     #: True when the register records a ramp / accessible entrance.
     accessible: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: Wi-Fi on site. It means someone can reach relatives from inside, which
+    #: matters over a long alert. NULL where the register says nothing — the
+    #: KMDA export has no such column, the oblast one answers for every row.
+    wifi: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     geom: Mapped[bytes] = mapped_column(
@@ -612,6 +616,7 @@ class NearestShelter:
     working_time: str | None
     phone: str | None
     accessible: bool | None
+    wifi: bool | None
     notes: str | None
     #: Distinct devices that have flagged a problem here.
     reports: int
@@ -635,7 +640,7 @@ _NEAREST_SHELTERS_SQL = text(
     candidates AS (
         SELECT s.id, s.name, s.shelter_type, s.source, s.address, s.district,
                s.kind, s.building_type, s.working_time, s.phone, s.accessible,
-               s.notes, s.geom
+               s.wifi, s.notes, s.geom
         FROM shelters s, pt
         WHERE s.source = ANY(:sources)
         ORDER BY s.geom <-> pt.g
@@ -664,6 +669,7 @@ _NEAREST_SHELTERS_SQL = text(
            c.working_time,
            c.phone,
            c.accessible,
+           c.wifi,
            c.notes,
            COALESCE(r.reports, 0) AS reports,
            ST_Y(c.geom) AS latitude,
@@ -718,6 +724,7 @@ async def find_nearest_shelters(
             working_time=row["working_time"],
             phone=row["phone"],
             accessible=row["accessible"],
+            wifi=row["wifi"],
             notes=row["notes"],
             reports=int(row["reports"]),
             latitude=float(row["latitude"]),

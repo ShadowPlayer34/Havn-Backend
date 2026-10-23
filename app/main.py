@@ -465,6 +465,7 @@ async def nearest_shelters(
                 working_time=r.working_time,
                 phone=r.phone,
                 accessible=r.accessible,
+                wifi=r.wifi,
                 notes=r.notes,
                 reports=r.reports,
                 latitude=r.latitude,

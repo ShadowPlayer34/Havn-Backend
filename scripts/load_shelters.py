@@ -98,11 +98,11 @@ _UPSERT = text(
     """
     INSERT INTO shelters (
         id, name, address, shelter_type, source, district, kind, building_type,
-        working_time, phone, owner, accessible, notes, geom
+        working_time, phone, owner, accessible, wifi, notes, geom
     )
     VALUES (
         :id, :name, :address, :shelter_type, :source, :district, :kind, :building_type,
-        :working_time, :phone, :owner, :accessible, :notes,
+        :working_time, :phone, :owner, :accessible, :wifi, :notes,
         ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)
     )
     ON CONFLICT (id) DO UPDATE SET
@@ -117,6 +117,7 @@ _UPSERT = text(
         phone         = EXCLUDED.phone,
         owner         = EXCLUDED.owner,
         accessible    = EXCLUDED.accessible,
+        wifi          = EXCLUDED.wifi,
         notes         = EXCLUDED.notes,
         geom          = EXCLUDED.geom
     """
@@ -185,9 +186,10 @@ def koda_row(feature: dict) -> dict | None:
     inclusive = (props.get("inclusive") or "").strip().lower()
     accessible = inclusive.startswith("так") if inclusive else None
 
-    # "wifi: Так" is the only extra worth surfacing — it means someone can reach
-    # relatives from inside, which matters over a long alert.
-    notes = "Wi-Fi available" if (props.get("wifi") or "").strip().lower().startswith("так") else None
+    # The register answers Так/Ні for every record, so an absent value is a gap
+    # in the export rather than a "no" — keep that distinction.
+    wifi_raw = (props.get("wifi") or "").strip().lower()
+    wifi = wifi_raw.startswith("так") if wifi_raw else None
 
     return {
         "id": f"koda{register_id}"[:32],
@@ -202,7 +204,8 @@ def koda_row(feature: dict) -> dict | None:
         "phone": None,
         "owner": None,
         "accessible": accessible,
-        "notes": notes,
+        "wifi": wifi,
+        "notes": None,
         "lon": float(lon),
         "lat": float(lat),
     }
@@ -248,6 +251,8 @@ def kmda_row(feature: dict) -> dict | None:
         "phone": (props.get("tel") or None),
         "owner": (props.get("owner") or None),
         "accessible": accessible,
+        # The city register carries no Wi-Fi column at all.
+        "wifi": None,
         "notes": (props.get("description") or None),
         "lon": float(lon),
         "lat": float(lat),
